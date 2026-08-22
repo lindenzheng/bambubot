@@ -23,9 +23,12 @@ Setup:
 
 import os
 import json
+import asyncio
+import traceback
 import time as time_module
 from datetime import datetime, timezone
 
+import aiohttp
 import discord
 from discord.ext import tasks
 import requests
@@ -869,22 +872,43 @@ async def update_status():
     # --- Update the status embed (in status channel) ---
     embed = build_status_embed(printer_statuses)
 
-    if status_message_id is not None:
-        try:
-            message = await status_channel.fetch_message(status_message_id)
-            await message.edit(embed=embed)
-        except discord.NotFound:
+    try:
+        if status_message_id is not None:
+            try:
+                message = await status_channel.fetch_message(status_message_id)
+                await message.edit(embed=embed)
+            except discord.NotFound:
+                # Message was deleted — post a fresh one and track it
+                message = await status_channel.send(embed=embed)
+                status_message_id = message.id
+        else:
             message = await status_channel.send(embed=embed)
             status_message_id = message.id
-    else:
-        message = await status_channel.send(embed=embed)
-        status_message_id = message.id
+    except (discord.HTTPException, aiohttp.ClientError, asyncio.TimeoutError) as e:
+        # Transient Discord/network problem (rate limit, 5xx, dropped connection).
+        # Skip this cycle rather than letting the exception kill the task loop.
+        print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] Status update failed, "
+              f"retrying next cycle: {e!r}")
 
 
 @update_status.before_loop
 async def before_update_status():
     """Wait until the bot is ready before starting the loop."""
     await bot.wait_until_ready()
+
+
+@update_status.error
+async def update_status_error(error):
+    """
+    Safety net: discord.py's tasks.loop dies silently if an exception escapes
+    the loop body. The bot stays 'online' but the status message freezes.
+    This logs the failure and restarts the loop instead.
+    """
+    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] update_status loop crashed: {error!r}")
+    traceback.print_exc()
+    await asyncio.sleep(10)
+    if not update_status.is_running():
+        update_status.restart()
 
 
 # ---------------------------------------------------------------------------
