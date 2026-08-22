@@ -176,6 +176,46 @@ class BambuMQTTClient:
         """Read a field from the cached 'print' status data."""
         return self._data.get("print", {}).get(key, default)
 
+    def get_hms_errors(self):
+        """
+        Parse HMS (Health Management System) error codes from the cached data.
+        Returns a list of dicts with 'code' (formatted string), 'url' (wiki link),
+        and 'module' (human-readable subsystem name).
+
+        HMS data comes as: [{"attr": <int>, "code": <int>}, ...]
+        - attr is a 32-bit int encoding module_id, module_no, part_id, part_no
+        - code is a 32-bit int encoding alert_level and error_code_id
+        - Together they form the HMS code: XXXX-XXXX-XXXX-XXXX
+        """
+        # First two hex digits of the HMS code identify the subsystem
+        MODULE_NAMES = {
+            "03": "Heatbed/Motion",
+            "05": "Main Board",
+            "07": "AMS",
+            "08": "Tool Head",
+            "0C": "Camera/Lidar",
+            "10": "Bambu Studio",
+            "11": "Bambu Handy",
+            "12": "AMS Lite",
+            "18": "AMS HT",
+        }
+
+        hms_list = self._data.get("print", {}).get("hms", [])
+        errors = []
+        for item in hms_list:
+            try:
+                attr = item.get("attr", 0)
+                code = item.get("code", 0)
+                attr_hex = f"{attr:08X}"
+                code_hex = f"{code:08X}"
+                hms_code = f"{attr_hex[0:4]}-{attr_hex[4:8]}-{code_hex[0:4]}-{code_hex[4:8]}"
+                wiki_url = f"https://wiki.bambulab.com/en/x1/troubleshooting/hmscode/{attr_hex[0:4]}_{attr_hex[4:8]}_{code_hex[0:4]}_{code_hex[4:8]}"
+                module = MODULE_NAMES.get(attr_hex[0:2].upper(), "Printer")
+                errors.append({"code": hms_code, "url": wiki_url, "module": module})
+            except (ValueError, TypeError):
+                continue
+        return errors
+
 
 # ---------------------------------------------------------------------------
 # Bambu Lab Connections
@@ -341,6 +381,8 @@ def get_bambu_status(printer_name):
             "raw_bambu_state": raw_state,
             "progress": percentage,
             "time_remaining": time_remaining_sec,
+            "hms_errors": client.get_hms_errors(),
+            "print_error": int(client.get_print_field("print_error", 0)),
         }
 
         # If printing, include file info in job_data format to match Prusa
@@ -385,6 +427,7 @@ def get_moonraker_status(ip):
 
         state_str = ps.get("state", "standby")
         file_name = ps.get("filename", "")
+        error_message = ps.get("message", "")
         # display_status.progress uses M73 from the slicer; some slicers
         # (including Snapmaker's) don't send M73, so fall back to
         # virtual_sdcard.progress which tracks file position
@@ -414,6 +457,7 @@ def get_moonraker_status(ip):
             "progress": progress,
             "time_remaining": None,  # Moonraker doesn't provide ETA natively
             "time_printing": print_duration,
+            "error_message": error_message if normalized_state == "ERROR" else None,
         }
 
         # If printing, include file info in job_data format
@@ -634,7 +678,15 @@ def build_status_embed(printer_statuses):
         elif status["state"] == "OFFLINE":
             value = "Printer is not reachable"
         elif status["state"] in ("ERROR", "ATTENTION"):
-            value = "Check printer"
+            hms_errors = status.get("hms_errors", [])
+            error_message = status.get("error_message")
+            if hms_errors:
+                hms = hms_errors[0]
+                value = f"{hms['module']} error: `{hms['code']}`\n[Troubleshoot]({hms['url']})"
+            elif error_message:
+                value = f"Error: {error_message}"
+            else:
+                value = "Check printer"
         else:
             value = "\u200b"  # Invisible character so Discord doesn't complain about empty value
 
@@ -654,7 +706,8 @@ async def on_ready():
     """Called when the bot connects to Discord."""
     print(f"Bot connected as {bot.user}")
     print(f"Monitoring {len(PRINTERS)} printer(s)")
-    update_status.start()
+    if not update_status.is_running():
+        update_status.start()
 
 
 @tasks.loop(seconds=POLL_INTERVAL)
@@ -720,16 +773,34 @@ async def update_status():
                 tracker["accumulated_seconds"] += elapsed
                 tracker["segment_start"] = None  # Frozen while paused
 
-        # --- Check for completed or failed prints ---
+        # --- Check for completed, cancelled, or failed prints ---
         if prev and prev["state"] in ("PRINTING", "PAUSED"):
             # For Bambu printers, raw_bambu_state == "FINISH" means completed
             bambu_finished = status.get("raw_bambu_state") == "FINISH"
             # For Moonraker printers, raw_moonraker_state == "complete" means completed
             moonraker_finished = status.get("raw_moonraker_state") == "complete"
+            # For Moonraker, "cancelled" is an explicit state
+            moonraker_cancelled = status.get("raw_moonraker_state") == "cancelled"
+
             print_ended = status["state"] in ("IDLE", "READY", "FINISHED") or bambu_finished or moonraker_finished
             print_failed = status["state"] in ("ERROR", "STOPPED")
 
-            if print_ended or print_failed:
+            # Determine if a "failure" is actually a user-initiated cancel:
+            # - Bambu: gcode_state goes to FAILED on cancel, but print_error == 0
+            #   and no HMS errors. A real failure has HMS errors or print_error != 0.
+            # - Moonraker: has an explicit "cancelled" state.
+            is_cancel = False
+            if print_failed:
+                hms_errors = status.get("hms_errors", [])
+                print_error = status.get("print_error", 0)
+                if not hms_errors and print_error == 0:
+                    is_cancel = True
+            if moonraker_cancelled:
+                is_cancel = True
+                print_ended = False
+                print_failed = False
+
+            if print_ended or print_failed or is_cancel:
                 # Calculate final duration:
                 # 1. Use printer-reported time_printing if available (Prusa)
                 # 2. Fall back to in-memory tracker (Bambu, or if API didn't report it)
@@ -760,12 +831,30 @@ async def update_status():
                         f"{duration_line}"
                         f"Your print is ready for pickup!"
                     )
+                elif is_cancel:
+                    await notification_channel.send(
+                        f"**Print Cancelled** on **{printer_name}**\n"
+                        f"`{prev_file}`\n"
+                        f"{mention}\n"
+                        f"{duration_line}"
+                    )
                 else:
+                    # Build error info for the notification
+                    hms_line = ""
+                    hms_errors = status.get("hms_errors", [])
+                    error_message = status.get("error_message")
+                    if hms_errors:
+                        hms = hms_errors[0]
+                        hms_line = f"{hms['module']} error: `{hms['code']}`\n[Troubleshoot on Bambu Wiki]({hms['url']})\n"
+                    elif error_message:
+                        hms_line = f"Error: {error_message}\n"
+
                     await notification_channel.send(
                         f"**Print Failed** on **{printer_name}**\n"
                         f"`{prev_file}`\n"
                         f"{mention}\n"
                         f"{duration_line}"
+                        f"{hms_line}"
                         f"Please check the printer."
                     )
 
