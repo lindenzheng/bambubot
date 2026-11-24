@@ -8,8 +8,41 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+VALID_STATUSES = {
+    "queued",
+    "cancelled",
+    "printing",
+    "completed",
+    "failed",
+}
 
-QUEUE_DATA_FILE = os.getenv("QUEUE_DATA_FILE", "queue.json")
+
+def normalize_status(status):
+    """Normalize job statuses for consistent comparisons."""
+    if status is None:
+        return None
+
+    status = str(status).strip().lower()
+
+    if status not in VALID_STATUSES:
+        return status
+
+    return status
+
+# QUEUE_DATA_FILE = os.getenv("QUEUE_DATA_FILE", "queue.json")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+configured_queue_file = os.getenv("QUEUE_DATA_FILE", "queue.json")
+
+if os.path.isabs(configured_queue_file):
+    QUEUE_DATA_FILE = configured_queue_file
+else:
+    QUEUE_DATA_FILE = os.path.join(
+        BASE_DIR,
+        configured_queue_file,
+    )
+
+print(f"[QUEUE] Data file: {QUEUE_DATA_FILE}")
 
 
 def now_iso():
@@ -87,23 +120,20 @@ def add_job(job):
 
 def requeue_job(thread_id):
     """Requeue a cancelled job."""
-    thread_id = str(thread_id)
-
     job = get_job(thread_id)
 
     if job is None:
         return False
 
-    if job["status"] != "cancelled":
+    if normalize_status(job.get("status")) != "cancelled":
         return False
 
-    update_job(
+    return update_job(
         thread_id,
         status="queued",
-        submitted_at=now_iso()
+        submitted_at=now_iso(),
+        cancelled_at=None,
     )
-
-    return True
 
 def update_job(thread_id, **changes):
     """Update fields on an existing job."""
@@ -111,6 +141,9 @@ def update_job(thread_id, **changes):
 
     if job is None:
         return False
+
+    if "status" in changes:
+        changes["status"] = normalize_status(changes["status"])
 
     job.update(changes)
     job["updated_at"] = now_iso()
@@ -126,41 +159,55 @@ def cancel_job(thread_id):
     if job is None:
         return False
 
-    if job["status"] != "queued":
+    if normalize_status(job.get("status")) != "queued":
         return False
 
-    update_job(
+    return update_job(
         thread_id,
         status="cancelled",
-        cancelled_at=now_iso()
+        cancelled_at=now_iso(),
     )
 
-    return True
+def delete_job(thread_id):
+    """Permanently remove a job from the queue database."""
+    thread_id = str(thread_id)
 
+    if thread_id not in queue_data["jobs"]:
+        return False
+
+    del queue_data["jobs"][thread_id]
+    save_queue(queue_data)
+
+    return True
 
 def set_priority(thread_id, priority=True):
     """Set or remove priority on a queued job."""
     job = get_job(thread_id)
 
-    if job is None or job["status"] != "queued":
+    if job is None:
         return False
 
-    update_job(thread_id, priority=priority)
-    return True
+    if normalize_status(job.get("status")) != "queued":
+        return False
+
+    return update_job(
+        thread_id,
+        priority=bool(priority),
+    )
 
 
 def get_active_jobs():
     """Return queued jobs in priority/FIFO order."""
     jobs = [
         job for job in get_jobs()
-        if job["status"] == "queued"
+        if normalize_status(job.get("status")) == "queued"
     ]
 
     return sorted(
         jobs,
         key=lambda job: (
-            not job.get("priority", False),
-            job.get("submitted_at", "")
+            not bool(job.get("priority", False)),
+            job.get("submitted_at", ""),
         )
     )
 
@@ -183,3 +230,7 @@ def get_queue_data():
 
 # Load persisted data when this module is imported.
 queue_data = load_queue()
+print(
+    f"[QUEUE] Loaded {len(queue_data['jobs'])} jobs "
+    f"from {QUEUE_DATA_FILE}"
+)

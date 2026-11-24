@@ -1,16 +1,20 @@
 """
-Makerspace 3D Printer Discord Bot
-Monitors Prusa (via PrusaLink HTTP), Bambu Lab (via MQTT), and
-Moonraker/Klipper printers like Snapmaker U1 (via HTTP) and
+Monitors Bambu Lab (via MQTT), 
+manages print queue--see queue_manager.py--and
 displays real-time status in Discord.
+
+Also supports Prusa (via PrusaLink HTTP) and
+Moonraker/Klipper printers like Snapmaker U1 (via HTTP).
 
 Features:
     - Status message that auto-updates (interval configurable in printers.json)
     - Supports both Prusa and Bambu Lab printers from one config file
     - Notification messages when a print completes or fails, including print duration
-    - Mentions the Discord user if their username is in the filename
-      (format: filename_@username.gcode)
+    # - Mentions the Discord user if their username is in the filename
+    #   (format: filename_@username.gcode)
     - Custom status title and refresh interval configurable in printers.json
+    - /queue, /priority, and /requeue commands
+    - Automatic job cancellation on thread deletion
 
 Requirements:
     pip install discord.py requests python-dotenv paho-mqtt
@@ -18,7 +22,7 @@ Requirements:
 Setup:
     1. Create a .env file with your DISCORD_TOKEN and channel IDs
     2. Edit printers.json to add your printers (type: "prusa" or "bambu")
-    3. Run: python3 3dprinter_discord_bot.py
+    3. Run: python3 bambubot.py
 """
 
 import os
@@ -47,7 +51,7 @@ import queue_manager
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-STATUS_CHANNEL_ID = int(os.getenv("STATUS_CHANNEL_ID", 0))
+STATUS_THREAD_ID = int(os.getenv("STATUS_THREAD_ID", 0))
 NOTIFICATION_CHANNEL_ID = int(os.getenv("NOTIFICATION_CHANNEL_ID", 0))
 PRINT_FORUM_ID = int(os.getenv("PRINT_FORUM_ID", 0))
 PRINTER_ADMIN_ROLE_ID = int(os.getenv("PRINTER_ADMIN_ROLE_ID", 0))
@@ -806,7 +810,7 @@ async def register_print_submission(message):
         f"🟡 **Print request added to the queue!**\n\n"
         f"**Job:** {thread.name}\n"
         f"**Queue position:** #{position}\n"
-        f"**File:** `{attachment.filename}`\n\n"
+        f"**File:** [{attachment.filename}]({job['attachment_url']})\n\n"
         f"Reply `cancel` to remove it from the queue."
     )
 
@@ -830,29 +834,85 @@ async def handle_cancel_request(message):
         await message.reply("This thread is not a registered print request.")
         return
 
-    if str(message.author.id) != job["requester_id"]:
-        await message.reply(
-            "Only the original requester can cancel this queued job."
-        )
-        return
+    # if str(message.author.id) != job["requester_id"]:
+    #     await message.reply(
+    #         "Only the original requester can cancel this queued job."
+    #     )
+    #     return
 
-    if not queue_manager.cancel_job(thread.id):
+    if not queue_manager.cancel_job(str(thread.id)):
         await message.reply(
             "This job cannot be cancelled because it is no longer queued."
         )
         return
 
-    await set_thread_tag(
+    tag_success = await set_thread_tag(
         thread,
         "CANCELLED",
         remove_status_tags=True,
     )
 
+    if not tag_success:
+        await message.reply(
+            "WARNING: The job was cancelled in the queue, but the forum tag "
+            "could not be updated. Please update the thread tags."
+        )
+
     await message.reply(
         f"⚪ **Print request cancelled.**\n"
-        f"`{thread.name}` has been removed from the queue."
+        f"`{thread.name}` has been removed from the queue.\n\n"
+        f"Reply `requeue` to add it back to the queue."
     )
 
+async def handle_requeue_request(message):
+    """Handle 'requeue' in a print thread."""
+    thread = message.channel
+
+    if not is_print_forum_thread(thread):
+        return
+
+    if message.author.bot:
+        return
+
+    if message.content.strip().lower() != "requeue":
+        return
+
+    job = queue_manager.get_job(thread.id)
+
+    if job is None:
+        await message.reply("This thread is not a registered print request.")
+        return
+
+    if not queue_manager.requeue_job(str(thread.id)):
+        await message.reply(
+            "This job cannot be requeued because it is currently queued."
+        )
+        return
+
+    tag_success = await set_thread_tag(
+        thread,
+        "QUEUED",
+        remove_status_tags=True,
+    )
+
+    if not tag_success:
+        await message.reply(
+            "WARNING: The job was requeued successfully, but the forum tag "
+            "could not be updated. Please update the thread tags."
+        )
+
+    position = queue_manager.get_queue_position(thread.id)
+
+    attachment_url = job.get("attachment_url", {})
+    filename = job.get("attachment_filename", "Unknown")
+
+    await message.reply(
+        f"🟡 **Print request re-added to the queue!**\n\n"
+        f"**Job:** {thread.name}\n"
+        f"**Queue position:** #{position}\n"
+        f"**File:** [{filename}]({attachment_url})\n\n"
+        f"Reply `cancel` to remove it from the queue."
+    )
 
 @bot.event
 async def on_message(message):
@@ -874,24 +934,22 @@ async def on_message(message):
     if is_print_forum_thread(message.channel):
         await register_print_submission(message)
         await handle_cancel_request(message)
+        await handle_requeue_request(message)
 
 @bot.event
 async def on_thread_delete(thread):
-    # Debugging
-    print(
-        f"Thread '{str(thread.id)}' deleted!" 
-    )
+    print(f"[QUEUE] Thread deleted: {thread.id}")
 
     job = queue_manager.get_job(str(thread.id))
 
     if job is None:
         return
 
-    queue_manager.cancel_job(str(thread.id))
+    queue_manager.delete_job(str(thread.id))
 
     print(
-        f"[QUEUE] Cancelled job '{job['title']}' "
-        f"because its parent thread was deleted."
+        f"[QUEUE] Removed '{job['title']}' from queue data "
+        f"because its thread was deleted."
     )
 
 @tree.command(name="queue", description="View the current 3D print queue")
@@ -958,118 +1016,76 @@ async def priority_command(
         )
         return
 
-    if job["status"] != "queued":
+    if queue_manager.normalize_status(job.get("status")) != "queued":
         await interaction.response.send_message(
-            "Only queued jobs can be prioritized.",
+            f"Cannot prioritize this job. Current status: "
+            f"`{job.get('status')}`.",
             ephemeral=True,
         )
         return
 
-    new_priority = not job.get("priority", False)
+    new_priority = not bool(job.get("priority", False))
 
-    queue_manager.set_priority(thread_id, new_priority)
-
-    forum = bot.get_channel(PRINT_FORUM_ID)
-    thread = forum.get_thread(int(thread_id)) if forum else None
-
-    if thread:
-        if new_priority:
-            tag = get_forum_tag(thread, "PRIORITY")
-            if tag and tag not in thread.applied_tags:
-                await thread.edit(
-                    applied_tags=list(thread.applied_tags) + [tag]
-                )
-        else:
-            tag = get_forum_tag(thread, "PRIORITY")
-            if tag:
-                await thread.edit(
-                    applied_tags=[
-                        existing for existing in thread.applied_tags
-                        if existing.id != tag.id
-                    ]
-                )
-
-    position = queue_manager.get_queue_position(thread_id)
-
-    await interaction.response.send_message(
-        f"{'🟣 Priority enabled' if new_priority else 'Priority removed'} "
-        f"for **{job['title']}**. New queue position: #{position}.",
-        ephemeral=True,
-    )
-
-@tree.command(name="requeue", description="Requeue a cancelled print job")
-@app_commands.describe(thread_id="The forum thread ID of the print request")
-async def requeue_command(
-    interaction: discord.Interaction,
-    thread_id: str,
-):
-
-    job = queue_manager.get_job(thread_id)
-
-    if job is None:
-        await interaction.response.send_message(
-            "Job not found. Use the forum thread ID.",
-            ephemeral=True,
-        )
-        return
-
-    if job["status"] != "cancelled":
-        await interaction.response.send_message(
-            "Only cancelled jobs can be requeued.",
-            ephemeral=True,
-        )
-        return
-    
-    try:
-        thread = interaction.guild.get_thread(int(thread_id))
-
-        if thread is None:
-            thread = await bot.fetch_channel(int(thread_id))
-
-        if not isinstance(thread, discord.Thread):
-            await interaction.response.send_message(
-                "The associated forum thread could not be found.",
-                ephemeral=True,
-            )
-            return
-
-    except (ValueError, discord.NotFound, discord.Forbidden):
-        await interaction.response.send_message(
-            "Could not access the original forum thread.",
-            ephemeral=True,
-        )
-        return
-
-    success = queue_manager.requeue_job(thread_id)
+    # Change the persistent queue first.
+    success = queue_manager.set_priority(thread_id, new_priority)
 
     if not success:
         await interaction.response.send_message(
-            "Could not requeue this job. Its status may have changed.",
+            "Failed to update priority. The job's status may have changed.",
             ephemeral=True,
         )
         return
 
-    await set_thread_tag(
-        thread,
-        "QUEUED",
-        remove_status_tags=True,
+    # Resolve the thread more reliably.
+    thread = interaction.guild.get_thread(int(thread_id))
+
+    if thread is None:
+        try:
+            thread = await bot.fetch_channel(int(thread_id))
+        except (discord.NotFound, discord.Forbidden):
+            thread = None
+
+    tag_sync_success = True
+
+    if thread and isinstance(thread, discord.Thread):
+        priority_tag = get_forum_tag(thread, "PRIORITY")
+
+        if priority_tag:
+            applied_tags = list(thread.applied_tags)
+
+            if new_priority:
+                if priority_tag not in applied_tags:
+                    applied_tags.append(priority_tag)
+            else:
+                applied_tags = [
+                    tag for tag in applied_tags
+                    if tag.id != priority_tag.id
+                ]
+
+            try:
+                await thread.edit(applied_tags=applied_tags)
+            except discord.HTTPException as e:
+                tag_sync_success = False
+                print(f"[QUEUE] Failed to sync priority tag: {e}")
+        else:
+            tag_sync_success = False
+            print("[QUEUE] PRIORITY forum tag not found.")
+
+    position = queue_manager.get_queue_position(thread_id)
+
+    result_message = (
+        f"{'🟣 Priority enabled' if new_priority else 'Priority removed'} "
+        f"for **{job['title']}**. New queue position: #{position}."
     )
 
-    position = queue_manager.get_queue_position(thread.id)
-
-    attachment = job.get("attachment", {})
-    filename = attachment.get("filename", "Unknown") if isinstance(attachment, dict) else "Unknown"
-
-    await thread.send(
-        f"🟡 **Print request re-added to the queue!**\n\n"
-        f"**Job:** {thread.name}\n"
-        f"**Queue position:** #{position}\n"
-        f"**File:** `{filename}`\n\n"
-        f"Reply `cancel` to remove it from the queue."
-    )
+    if not tag_sync_success:
+        result_message += (
+            "\nWARNING: The queue was updated, but the forum tag could not "
+            "be synchronized."
+        )
 
     await interaction.response.send_message(
-        f"Successfully requeued **{thread.name}** at position #{position}.",
+        result_message,
         ephemeral=True,
     )
 
@@ -1146,18 +1162,20 @@ async def update_status():
     """Periodically poll printers and update the status message in Discord."""
     global status_message_id, previous_states
 
-    status_channel = bot.get_channel(STATUS_CHANNEL_ID)
+    forum = bot.get_channel(PRINT_FORUM_ID)
+    status_thread = forum.get_thread(int(STATUS_THREAD_ID)) if forum else None
+    
     notification_channel = bot.get_channel(NOTIFICATION_CHANNEL_ID)
 
-    if status_channel is None:
+    if status_thread is None:
         try:
-            status_channel = await bot.fetch_channel(STATUS_CHANNEL_ID)
-            print(f"Successfully fetched status channel: {status_channel.name}")
+            status_thread = await bot.fetch_channel(STATUS_THREAD_ID)
+            print(f"Successfully fetched status channel: {status_thread.name}")
         except discord.NotFound:
-            print(f"Error: Status channel ID {STATUS_CHANNEL_ID} does not exist.")
+            print(f"Error: Status channel ID {STATUS_THREAD_ID} does not exist.")
             return
         except discord.Forbidden:
-            print(f"Error: Bot does not have permission to access status channel {STATUS_CHANNEL_ID}.")
+            print(f"Error: Bot does not have permission to access status channel {STATUS_THREAD_ID}.")
             return
         except discord.HTTPException as e:
             print(f"Error fetching status channel: {e}")
@@ -1167,7 +1185,7 @@ async def update_status():
         print(f"Error: Could not find notification channel with ID {NOTIFICATION_CHANNEL_ID}")
         return
 
-    guild = status_channel.guild
+    guild = status_thread.guild
 
     # Poll all printers and collect statuses
     printer_statuses = []
@@ -1309,14 +1327,14 @@ async def update_status():
     try:
         if status_message_id is not None:
             try:
-                message = await status_channel.fetch_message(status_message_id)
+                message = await status_thread.fetch_message(status_message_id)
                 await message.edit(embed=embed)
             except discord.NotFound:
                 # Message was deleted — post a fresh one and track it
-                message = await status_channel.send(embed=embed)
+                message = await status_thread.send(embed=embed)
                 status_message_id = message.id
         else:
-            message = await status_channel.send(embed=embed)
+            message = await status_thread.send(embed=embed)
             status_message_id = message.id
     except (discord.HTTPException, aiohttp.ClientError, asyncio.TimeoutError) as e:
         # Transient Discord/network problem (rate limit, 5xx, dropped connection).
@@ -1355,9 +1373,9 @@ if __name__ == "__main__":
         print("Create a .env file with: DISCORD_TOKEN=your_token_here")
         exit(1)
 
-    if STATUS_CHANNEL_ID == 0:
-        print("Error: STATUS_CHANNEL_ID not found in .env file")
-        print("Add to .env file: STATUS_CHANNEL_ID=your_channel_id_here")
+    if STATUS_THREAD_ID == 0:
+        print("Error: STATUS_THREAD_ID not found in .env file")
+        print("Add to .env file: STATUS_THREAD_ID=your_thread_id_here")
         exit(1)
 
     if NOTIFICATION_CHANNEL_ID == 0:
