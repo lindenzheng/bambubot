@@ -31,11 +31,14 @@ from datetime import datetime, timezone
 import aiohttp
 import discord
 from discord.ext import tasks
+from discord import app_commands
 import requests
 from dotenv import load_dotenv
 
 import ssl
 import paho.mqtt.client as mqtt
+
+import queue_manager
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -46,6 +49,8 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 STATUS_CHANNEL_ID = int(os.getenv("STATUS_CHANNEL_ID", 0))
 NOTIFICATION_CHANNEL_ID = int(os.getenv("NOTIFICATION_CHANNEL_ID", 0))
+PRINT_FORUM_ID = int(os.getenv("PRINT_FORUM_ID", 0))
+PRINTER_ADMIN_ROLE_ID = int(os.getenv("PRINTER_ADMIN_ROLE_ID", 0))
 
 # How often to poll printers (in seconds)
 POLL_INTERVAL = 30
@@ -630,6 +635,7 @@ intents.message_content = True
 intents.members = True  # Required to look up members by username
 intents.guilds = True
 bot = discord.Client(intents=intents)
+tree = app_commands.CommandTree(bot)
 
 # Store the message ID so we can edit the same pinned message each time
 status_message_id = None
@@ -652,10 +658,317 @@ PRINTERS, POLL_INTERVAL, STATUS_TITLE = load_config()
 # Connect to Bambu printers (MQTT background connections)
 connect_bambu_printers(PRINTERS)
 
+# ---------------------------------------------------------------------------
+# Print Queue
+# ---------------------------------------------------------------------------
+
+QUEUE_STATUS_TAGS = {
+    "QUEUED",
+    "PRINTING",
+    "COMPLETED",
+    "FAILED",
+    "CANCELLED",
+}
+
+def get_forum_tag(channel, tag_name):
+    """Find a forum tag by name."""
+    forum = channel.parent if isinstance(channel, discord.Thread) else channel
+
+    if not isinstance(forum, discord.ForumChannel):
+        return None
+
+    return next(
+        (
+            tag for tag in forum.available_tags
+            if tag.name.lower() == tag_name.lower()
+        ),
+        None,
+    )
+
+
+async def set_thread_tag(thread, tag_name, remove_status_tags=False):
+    """Apply a forum tag while preserving other tags."""
+    tag = get_forum_tag(thread, tag_name)
+
+    if tag is None:
+        print(f"Warning: Forum tag '{tag_name}' not found")
+        return False
+
+    applied_tags = list(thread.applied_tags)
+
+    if remove_status_tags:
+        applied_tags = [
+            existing for existing in applied_tags
+            if existing.name.upper() not in QUEUE_STATUS_TAGS
+        ]
+
+    if tag not in applied_tags:
+        applied_tags.append(tag)
+
+    await thread.edit(applied_tags=applied_tags)
+    return True
+
+
+def is_print_forum_thread(channel):
+    """Check whether a thread belongs to the configured print forum."""
+    return (
+        isinstance(channel, discord.Thread)
+        and channel.parent_id == PRINT_FORUM_ID
+    )
+
+
+def is_printer_admin(member):
+    """Check whether a member is an administrator or has the configured role."""
+    if member.guild_permissions.administrator:
+        return True
+
+    if PRINTER_ADMIN_ROLE_ID == 0:
+        return False
+
+    return any(
+        role.id == PRINTER_ADMIN_ROLE_ID
+        for role in member.roles
+    )
+
+
+async def register_print_submission(message):
+    """Validate and register a new forum print request."""
+    thread = message.channel
+
+    if not is_print_forum_thread(thread):
+        return
+
+    # Only process the initial forum post, not replies.
+    if message.id != thread.id:
+        return
+
+    if message.author.bot:
+        return
+
+    # Require at least one STL attachment.
+    stl_files = [
+        attachment for attachment in message.attachments
+        if attachment.filename.lower().endswith(".stl")
+    ]
+
+    if not stl_files:
+        await message.reply(
+            "WARNING: Your print request was not added to the queue. "
+            "Please attach at least one `.stl` file to the original post."
+        )
+        return
+
+    # This is a temporary requirement to simplify implementation.
+    if len(stl_files) > 1:
+        await message.reply(
+            "WARNING: Please submit one STL per forum post. "
+            "Create separate posts for separate print jobs."
+        )
+        return
+
+    attachment = stl_files[0]
+
+    job = {
+        "thread_id": str(thread.id),
+        "requester_id": str(message.author.id),
+        "title": thread.name,
+        "project": None,
+        "attachment_url": attachment.url,
+        "attachment_filename": attachment.filename,
+        "attachment_size": attachment.size,
+        "status": "queued",
+        "priority": False,
+        "submitted_at": queue_manager.now_iso(),
+        "updated_at": queue_manager.now_iso(),
+        "started_at": None,
+        "completed_at": None,
+        "printer": None,
+        "subscribers": [],
+    }
+
+    if not queue_manager.add_job(job):
+        # Prevent duplicate processing of the same forum post.
+        return
+
+    await set_thread_tag(
+        thread,
+        "QUEUED",
+        remove_status_tags=True,
+    )
+
+    position = queue_manager.get_queue_position(thread.id)
+
+    await message.reply(
+        f"🟡 **Print request added to the queue!**\n\n"
+        f"**Job:** {thread.name}\n"
+        f"**Queue position:** #{position}\n"
+        f"**File:** `{attachment.filename}`\n\n"
+        f"Reply `cancel` to remove it from the queue."
+    )
+
+
+async def handle_cancel_request(message):
+    """Handle 'cancel' in a print thread."""
+    thread = message.channel
+
+    if not is_print_forum_thread(thread):
+        return
+
+    if message.author.bot:
+        return
+
+    if message.content.strip().lower() != "cancel":
+        return
+
+    job = queue_manager.get_job(thread.id)
+
+    if job is None:
+        await message.reply("This thread is not a registered print request.")
+        return
+
+    if str(message.author.id) != job["requester_id"]:
+        await message.reply(
+            "Only the original requester can cancel this queued job."
+        )
+        return
+
+    if not queue_manager.cancel_job(thread.id):
+        await message.reply(
+            "This job cannot be cancelled because it is no longer queued."
+        )
+        return
+
+    await set_thread_tag(
+        thread,
+        "CANCELLED",
+        remove_status_tags=True,
+    )
+
+    await message.reply(
+        f"⚪ **Print request cancelled.**\n"
+        f"`{thread.name}` has been removed from the queue."
+    )
+
+
+@bot.event
+async def on_message(message):
+    """Handle forum submissions and cancellation replies."""
+    if message.author.bot:
+        return
+
+    if is_print_forum_thread(message.channel):
+        await register_print_submission(message)
+        await handle_cancel_request(message)
+
+
+@tree.command(name="queue", description="View the current 3D print queue")
+async def queue_command(interaction: discord.Interaction):
+    jobs = queue_manager.get_active_jobs()
+
+    if not jobs:
+        await interaction.response.send_message(
+            "The print queue is currently empty. 🟢",
+            ephemeral=True,
+        )
+        return
+
+    lines = []
+
+    for position, job in enumerate(jobs, start=1):
+        priority = "🟣 " if job.get("priority") else ""
+        requester = f"<@{job['requester_id']}>"
+
+        thread = interaction.guild.get_thread(
+            int(job["thread_id"])
+        )
+
+        if thread:
+            title = f"[{job['title']}]({thread.jump_url})"
+        else:
+            title = job["title"]
+
+        lines.append(
+            f"**{position}.** {priority}{title} — {requester}"
+        )
+
+    embed = discord.Embed(
+        title="Print Queue",
+        description="\n".join(lines),
+        color=0x4A90D9,
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True,
+    )
+
+
+@tree.command(name="priority", description="Toggle priority for a queued print")
+@app_commands.describe(thread_id="The forum thread ID of the print request")
+async def priority_command(
+    interaction: discord.Interaction,
+    thread_id: str,
+):
+    if not is_printer_admin(interaction.user):
+        await interaction.response.send_message(
+            "You do not have permission to prioritize print jobs.",
+            ephemeral=True,
+        )
+        return
+
+    job = queue_manager.get_job(thread_id)
+
+    if job is None:
+        await interaction.response.send_message(
+            "Job not found. Use the forum thread ID.",
+            ephemeral=True,
+        )
+        return
+
+    if job["status"] != "queued":
+        await interaction.response.send_message(
+            "Only queued jobs can be prioritized.",
+            ephemeral=True,
+        )
+        return
+
+    new_priority = not job.get("priority", False)
+
+    queue_manager.set_priority(thread_id, new_priority)
+
+    forum = bot.get_channel(PRINT_FORUM_ID)
+    thread = forum.get_thread(int(thread_id)) if forum else None
+
+    if thread:
+        if new_priority:
+            tag = get_forum_tag(thread, "PRIORITY")
+            if tag and tag not in thread.applied_tags:
+                await thread.edit(
+                    applied_tags=list(thread.applied_tags) + [tag]
+                )
+        else:
+            tag = get_forum_tag(thread, "PRIORITY")
+            if tag:
+                await thread.edit(
+                    applied_tags=[
+                        existing for existing in thread.applied_tags
+                        if existing.id != tag.id
+                    ]
+                )
+
+    position = queue_manager.get_queue_position(thread_id)
+
+    await interaction.response.send_message(
+        f"{'🟣 Priority enabled' if new_priority else 'Priority removed'} "
+        f"for **{job['title']}**. New queue position: #{position}.",
+        ephemeral=True,
+    )
+
+
 
 def build_status_embed(printer_statuses):
     """
-    Build a Discord embed with all printer statuses.
+    Discord embed with all printer statuses.
     printer_statuses is a list of (printer, status, file_name, username) tuples.
     Returns a discord.Embed object.
     """
@@ -833,7 +1146,7 @@ async def update_status():
                         f"`{prev_file}`\n"
                         f"{mention}\n"
                         f"{duration_line}"
-                        f"Your print is ready for pickup!"
+                        f"This print is ready for pickup!"
                     )
                 elif is_cancel:
                     await notification_channel.send(
