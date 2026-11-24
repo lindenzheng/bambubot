@@ -4,6 +4,10 @@ import os
 import tempfile
 from datetime import datetime, timezone
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 
 QUEUE_DATA_FILE = os.getenv("QUEUE_DATA_FILE", "queue.json")
 

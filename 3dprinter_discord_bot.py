@@ -1050,10 +1050,6 @@ async def update_status():
         print(f"Error: Could not find notification channel with ID {NOTIFICATION_CHANNEL_ID}")
         return
 
-    # On first run, clear the status channel so it's clean
-    if status_message_id is None:
-        await status_channel.purge()
-
     guild = status_channel.guild
 
     # Poll all printers and collect statuses
