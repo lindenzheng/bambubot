@@ -772,7 +772,12 @@ async def register_print_submission(message):
         "thread_id": str(thread.id),
         "requester_id": str(message.author.id),
         "title": thread.name,
-        "project": None,
+        "project": ", ".join(
+            tag.name
+            for tag in thread.applied_tags
+            if tag.name.upper() not in QUEUE_STATUS_TAGS
+            and tag.name.upper() != "PRIORITY"
+        ),
         "attachment_url": attachment.url,
         "attachment_filename": attachment.filename,
         "attachment_size": attachment.size,
