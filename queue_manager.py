@@ -85,23 +85,6 @@ def add_job(job):
     save_queue(queue_data)
     return True
 
-def requeue_job(thread_id):
-    """Requeue a cancelled job."""
-    job = get_job(thread_id)
-
-    if job is None:
-        return False
-
-    if job["status"] != "cancelled":
-        return False
-
-    update_job(
-        thread_id,
-        status="queued",
-        submitted_at=now_iso()
-    )
-
-    return True
 
 def update_job(thread_id, **changes):
     """Update fields on an existing job."""
