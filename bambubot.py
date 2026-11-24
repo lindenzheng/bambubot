@@ -791,7 +791,7 @@ async def register_print_submission(message):
         "started_at": None,
         "completed_at": None,
         "printer": None,
-        "subscribers": [],
+        "subscribers": [str(message.author.id)],
     }
 
     if not queue_manager.add_job(job):
@@ -1086,6 +1086,49 @@ async def priority_command(
 
     await interaction.response.send_message(
         result_message,
+        ephemeral=True,
+    )
+
+@tree.command(
+    name="notify",
+    description="Toggle notifications for a print job"
+)
+@app_commands.describe(
+    thread_id="The forum thread ID of the print request"
+)
+async def subscribe_command(
+    interaction: discord.Interaction,
+    thread_id: str,
+):
+    job = queue_manager.get_job(thread_id)
+
+    if job is None:
+        await interaction.response.send_message(
+            "Print job not found.",
+            ephemeral=True,
+        )
+        return
+
+    success = queue_manager.subscribe_job(
+        thread_id,
+        interaction.user.id,
+    )
+
+    if not success:
+        success = queue_manager.unsubscribe_job(
+        thread_id,
+        interaction.user.id,
+        )
+        await interaction.response.send_message(
+            f"You have unsubscribed from notifications for "
+            f"**{job['title']}**.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        f"You are now subscribed to notifications for "
+        f"**{job['title']}**.",
         ephemeral=True,
     )
 

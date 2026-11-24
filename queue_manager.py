@@ -195,6 +195,47 @@ def set_priority(thread_id, priority=True):
         priority=bool(priority),
     )
 
+def start_job(thread_id, printer_name):
+    """Mark a queued job as started on a printer."""
+    job = get_job(thread_id)
+
+    if job is None:
+        return False
+
+    if normalize_status(job.get("status")) != "queued":
+        return False
+
+    return update_job(
+        thread_id,
+        status="printing",
+        printer=str(printer_name),
+        started_at=now_iso(),
+        completed_at=None,
+        priority=False,
+    )
+
+def complete_job(thread_id, printer_name=None):
+    """Mark an assigned printing job as completed."""
+    job = get_job(thread_id)
+
+    if job is None:
+        return False
+
+    if normalize_status(job.get("status")) != "printing":
+        return False
+
+    if (
+        printer_name is not None
+        and str(job.get("printer", "")).casefold()
+        != str(printer_name).casefold()
+    ):
+        return False
+
+    return update_job(
+        thread_id,
+        status="completed",
+        completed_at=now_iso(),
+    )
 
 def get_active_jobs():
     """Return queued jobs in priority/FIFO order."""
@@ -227,6 +268,48 @@ def get_queue_data():
     """Return queue data for other modules."""
     return queue_data
 
+def subscribe_job(thread_id, user_id):
+    """Subscribe a user to job notifications."""
+    job = get_job(thread_id)
+
+    if job is None:
+        return False
+
+    user_id = str(user_id)
+
+    subscribers = job.setdefault("subscribers", [])
+
+    if user_id in subscribers:
+        return False
+
+    subscribers.append(user_id)
+
+    return update_job(
+        thread_id,
+        subscribers=subscribers,
+    )
+
+
+def unsubscribe_job(thread_id, user_id):
+    """Unsubscribe a user from job notifications."""
+    job = get_job(thread_id)
+
+    if job is None:
+        return False
+
+    user_id = str(user_id)
+
+    subscribers = job.get("subscribers", [])
+
+    if user_id not in subscribers:
+        return False
+
+    subscribers.remove(user_id)
+
+    return update_job(
+        thread_id,
+        subscribers=subscribers,
+    )
 
 # Load persisted data when this module is imported.
 queue_data = load_queue()
