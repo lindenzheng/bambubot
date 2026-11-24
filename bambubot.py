@@ -58,6 +58,7 @@ POLL_INTERVAL = 30
 # Path to the printer config file
 PRINTERS_CONFIG = "printers.json"
 
+print(f"STATUS_CHANNEL_ID = {STATUS_CHANNEL_ID}")
 
 def load_config():
     """
@@ -858,13 +859,37 @@ async def handle_cancel_request(message):
 @bot.event
 async def on_message(message):
     """Handle forum submissions and cancellation replies."""
+
+    print(
+        f"[DEBUG] Message received | "
+        f"Author: {message.author} | "
+        f"Channel: {message.channel} | "
+        f"Channel type: {type(message.channel).__name__} | "
+        f"Content: {message.content!r}"
+    )
+
     if message.author.bot:
         return
+
+    print("[DEBUG] Message from a human received.")
 
     if is_print_forum_thread(message.channel):
         await register_print_submission(message)
         await handle_cancel_request(message)
 
+@bot.event
+async def on_thread_delete(thread):
+    job = queue_manager.get_job(str(thread.id))
+
+    if job is None:
+        return
+
+    queue_manager.delete_job(str(thread.id))
+
+    print(
+        f"[QUEUE] Removed job '{job['title']}' "
+        f"because its parent thread was deleted."
+    )
 
 @tree.command(name="queue", description="View the current 3D print queue")
 async def queue_command(interaction: discord.Interaction):
@@ -969,7 +994,81 @@ async def priority_command(
         ephemeral=True,
     )
 
+@tree.command(name="requeue", description="Requeue a cancelled print job")
+@app_commands.describe(thread_id="The forum thread ID of the print request")
+async def requeue_command(
+    interaction: discord.Interaction,
+    thread_id: str,
+):
 
+    job = queue_manager.get_job(thread_id)
+
+    if job is None:
+        await interaction.response.send_message(
+            "Job not found. Use the forum thread ID.",
+            ephemeral=True,
+        )
+        return
+
+    if job["status"] != "cancelled":
+        await interaction.response.send_message(
+            "Only cancelled jobs can be requeued.",
+            ephemeral=True,
+        )
+        return
+    
+    try:
+        thread = interaction.guild.get_thread(int(thread_id))
+
+        if thread is None:
+            thread = await bot.fetch_channel(int(thread_id))
+
+        if not isinstance(thread, discord.Thread):
+            await interaction.response.send_message(
+                "The associated forum thread could not be found.",
+                ephemeral=True,
+            )
+            return
+
+    except (ValueError, discord.NotFound, discord.Forbidden):
+        await interaction.response.send_message(
+            "Could not access the original forum thread.",
+            ephemeral=True,
+        )
+        return
+
+    success = queue_manager.requeue_job(thread_id)
+
+    if not success:
+        await interaction.response.send_message(
+            "Could not requeue this job. Its status may have changed.",
+            ephemeral=True,
+        )
+        return
+
+    await set_thread_tag(
+        thread,
+        "QUEUED",
+        remove_status_tags=True,
+    )
+
+    position = queue_manager.get_queue_position(thread.id)
+
+    attachment = job.get("attachment", {})
+    filename = attachment.get("filename", "Unknown") if isinstance(attachment, dict) else "Unknown"
+
+    await thread.send(
+        f"🟡 **Print request re-added to the queue!**\n\n"
+        f"**Job:** {thread.name}\n"
+        f"**Queue position:** #{position}\n"
+        f"**File:** `{filename}`\n\n"
+        f"Reply `cancel` to remove it from the queue."
+    )
+
+    await interaction.response.send_message(
+        f"Successfully requeued **{thread.name}** at position #{position}.",
+        ephemeral=True,
+    )
 
 def build_status_embed(printer_statuses):
     """
@@ -1048,8 +1147,18 @@ async def update_status():
     notification_channel = bot.get_channel(NOTIFICATION_CHANNEL_ID)
 
     if status_channel is None:
-        print(f"Error: Could not find status channel with ID {STATUS_CHANNEL_ID}")
-        return
+        try:
+            status_channel = await bot.fetch_channel(STATUS_CHANNEL_ID)
+            print(f"Successfully fetched status channel: {status_channel.name}")
+        except discord.NotFound:
+            print(f"Error: Status channel ID {STATUS_CHANNEL_ID} does not exist.")
+            return
+        except discord.Forbidden:
+            print(f"Error: Bot does not have permission to access status channel {STATUS_CHANNEL_ID}.")
+            return
+        except discord.HTTPException as e:
+            print(f"Error fetching status channel: {e}")
+            return
 
     if notification_channel is None:
         print(f"Error: Could not find notification channel with ID {NOTIFICATION_CHANNEL_ID}")
