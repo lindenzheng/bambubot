@@ -23,7 +23,14 @@ def load_queue():
 
     try:
         with open(QUEUE_DATA_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            contents = f.read()
+
+        # Treat empty files as a new, empty queue.
+        if not contents.strip():
+            print("Queue file is empty. Initializing empty queue.")
+            return {"jobs": {}}
+
+        data = json.loads(contents)
 
         if not isinstance(data, dict) or "jobs" not in data:
             raise ValueError("Invalid queue file structure")
