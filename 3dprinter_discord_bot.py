@@ -1023,6 +1023,13 @@ async def on_ready():
     """Called when the bot connects to Discord."""
     print(f"Bot connected as {bot.user}")
     print(f"Monitoring {len(PRINTERS)} printer(s)")
+
+    try:
+        synced = await tree.sync()
+        print(f"Synced {len(synced)} slash command(s)")
+    except Exception as e:
+        print(f"Failed to sync slash commands: {e}")
+
     if not update_status.is_running():
         update_status.start()
 
