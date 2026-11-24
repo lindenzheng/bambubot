@@ -5,6 +5,7 @@ printers.json
 printers*.json
 !printers.json.example
 *copy*.json
+queue.json
 
 # Test scripts with real credentials
 *_test.py

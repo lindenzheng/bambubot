@@ -628,6 +628,7 @@ async def find_member_by_username(guild, username):
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True  # Required to look up members by username
+intents.guilds = True
 bot = discord.Client(intents=intents)
 
 # Store the message ID so we can edit the same pinned message each time
